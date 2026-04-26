@@ -154,6 +154,17 @@ Settings → Environment Variables → 加入 `APPS_SCRIPT_URL` 和 `APPS_SCRIPT
 
 ## 版本紀錄
 
+### v3.9（2026-04-26）當前版本
+**對應憲法：** investment_logic_v38.md
+
+**UI 升級（Claude Design）：**
+- Skeleton loading（載入時骨架屏，不再顯示空白）
+- DonutChart（All Weather 配置圓環圖）
+- LineChart（淨資產歷史折線圖，從 Capital Log bankRows 抓取）
+- Card hover 效果（滑鼠懸停微浮起）
+- Row hover 效果（持倉 / 績效列 hover 高亮）
+- Tab 記憶（localStorage 記住上次瀏覽的 Tab）
+
 ### v3.8（2026-04-25）當前版本
 **對應憲法：** investment_logic_v38.md
 

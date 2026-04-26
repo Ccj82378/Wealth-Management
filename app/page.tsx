@@ -6,7 +6,6 @@ const fmtPct = (n: number) => `${(n * 100).toFixed(1)}%`;
 const fmtNum = (n: number, d = 2) => Number(n).toFixed(d);
 const toF = (v: unknown): number => parseFloat(String(v ?? '0').replace(/,/g, '')) || 0;
 
-// Ticker 直接用原始值（已統一為 006208, 00878, 2059 等）
 const getPrice = (cfg: Record<string, unknown>, ticker: string): number =>
   toF(cfg[`${ticker}現價`]) || 0;
 
@@ -25,7 +24,9 @@ interface SimRow {
   mode: 'list' | 'custom'; ticker: string; shares: number;
   customTicker: string; customPrice: number; customCurrency: string;
 }
+interface NWPoint { m: string; val: number; }
 
+// ── Data fetching ────────────────────────────────────────
 function usePortfolioData() {
   const [data, setData] = useState<Record<string, unknown> | null>(null);
   const [loading, setLoading] = useState(true);
@@ -46,6 +47,7 @@ function usePortfolioData() {
   return { data, loading, error, lastUpdated, refetch: fetchData };
 }
 
+// ── Compute ──────────────────────────────────────────────
 function compute(data: Record<string, unknown> | null) {
   if (!data) return null;
   const cfg = (data.Settings || {}) as Record<string, unknown>;
@@ -68,7 +70,6 @@ function compute(data: Record<string, unknown> | null) {
   const dca6208Pct = toF(cfg['006208定投佔比']) || 0.7;
   const dca878Pct  = toF(cfg['00878定投佔比'])  || 0.3;
 
-  // Positions — ticker 直接用 Tickers 清單的值 match Trade Log
   const positions: Position[] = tickers.map(t => {
     const tid = String(t.ticker);
     const buys  = trades.filter(r => String(r[1]) === tid && r[3] === 'Buy');
@@ -94,6 +95,12 @@ function compute(data: Record<string, unknown> | null) {
   const base = avail + totInv;
   const netWorth = latestBank + totInv;
 
+  // Net worth history: last 6 Bank Update rows (DATE + Total Amount TWD)
+  const nwHistory: NWPoint[] = bankRows.slice(-6).map(r => ({
+    m: `${new Date(String(r[0])).getMonth() + 1}月`,
+    val: toF(r[9]),
+  }));
+
   const twdStocks = positions.filter(p => p.currency === 'TWD').reduce((s, p) => s + p.mvTWD, 0);
   const usdStocks = positions.filter(p => p.currency === 'USD').reduce((s, p) => s + p.mvTWD, 0);
   const twdTotal = latestBank + twdStocks;
@@ -110,7 +117,6 @@ function compute(data: Record<string, unknown> | null) {
     gapAmt: (tgt - (base > 0 ? awCur[cat] / base : 0)) * base,
   }));
 
-  // 利息：加權平均利率 × 總餘額
   const avgRate = banks.length > 0 ? banks.reduce((s, b) => s + b.rate, 0) / banks.length : 0;
   const annInt = latestBank * avgRate;
   const annDiv = positions.reduce((s, p) => s + p.mvTWD * (p.yield || 0), 0);
@@ -135,14 +141,12 @@ function compute(data: Record<string, unknown> | null) {
   }
   const estMonths = monthlyGrowth > 0 ? Math.ceil((targetNW - netWorth) / monthlyGrowth) : null;
 
-  // DCA
   const dcaPlan = [
     { ticker: '006208', name: '富邦台50', budget: fixedDCA * dca6208Pct, cp: getPrice(cfg, '006208') },
     { ticker: '00878',  name: '國泰ESG',  budget: fixedDCA * dca878Pct,  cp: getPrice(cfg, '00878') },
   ].map(d => ({ ...d, shares: d.cp > 0 ? Math.floor(d.budget / d.cp) : 0 }))
    .map(d => ({ ...d, amt: d.shares * d.cp, residual: d.budget - d.shares * d.cp }));
 
-  // 警示
   const warns: string[] = [];
   const usdWarnLine = toF(cfg['美元資產警戒線']) || 0.5;
   if (usdPct >= usdWarnLine)
@@ -164,7 +168,6 @@ function compute(data: Record<string, unknown> | null) {
   if (latestBank > 0 && avail <= (toF(cfg['現金水位警戒線']) || 500000))
     warns.push(`可動用現金 ${fmtTWD(avail)}，低於警戒線`);
 
-  // 經濟象限 & 匯率
   const growthS  = String(cfg['成長方向(短期)'] || '');
   const inflS    = String(cfg['通膨方向(短期)'] || '');
   const quadrant    = String(cfg['當前象限']     || '—');
@@ -186,14 +189,111 @@ function compute(data: Record<string, unknown> | null) {
     awRows, awCur, awTargets, totPnL, monthly, annInt, annDiv, annYield,
     goalPct, estMonths, targetNW, deployAmt, fixedDCA,
     warns, growthS, inflS, quadrant, quadConfirm, stressStatus, fxTrend,
-    realizedRows, dcaPlan,
+    realizedRows, dcaPlan, nwHistory,
     monthSalary, monthBonus, monthDividend, monthOther,
   };
 }
 
+// ── Visual components ────────────────────────────────────
+
+function Skeleton({ w = '100%', h = 14, r = 4 }: { w?: string | number; h?: number; r?: number }) {
+  return <div className="skeleton" style={{ width: w, height: h, borderRadius: r }} />;
+}
+
+function SkeletonCard({ lines = 2 }: { lines?: number }) {
+  return (
+    <div style={{ background: '#fff', border: '1px solid #e6e2dc', borderRadius: 6, padding: '14px 16px', boxShadow: '0 1px 4px rgba(0,0,0,.05)' }}>
+      <Skeleton h={10} w="50%" />
+      <div style={{ marginTop: 8 }}><Skeleton h={18} w="70%" /></div>
+      {lines > 1 && <div style={{ marginTop: 6 }}><Skeleton h={10} w="40%" /></div>}
+    </div>
+  );
+}
+
+function polarToCart(cx: number, cy: number, r: number, deg: number): [number, number] {
+  const rad = (deg - 90) * Math.PI / 180;
+  return [cx + r * Math.cos(rad), cy + r * Math.sin(rad)];
+}
+
+function DonutChart({ segs, size = 120, thick = 16 }: { segs: { val: number; color: string }[]; size?: number; thick?: number }) {
+  const r = (size - thick) / 2;
+  const cx = size / 2, cy = size / 2;
+  const total = segs.reduce((s, d) => s + d.val, 0);
+  if (total <= 0) return null;
+  let angle = 0;
+  const paths = segs.map(s => {
+    const start = angle;
+    const sweep = (s.val / total) * 360;
+    angle += sweep;
+    const end = angle - 1.5;
+    const [x1, y1] = polarToCart(cx, cy, r, start);
+    const [x2, y2] = polarToCart(cx, cy, r, end);
+    return { color: s.color, d: `M ${x1.toFixed(2)} ${y1.toFixed(2)} A ${r} ${r} 0 ${sweep > 180 ? 1 : 0} 1 ${x2.toFixed(2)} ${y2.toFixed(2)}` };
+  });
+  return (
+    <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
+      <circle cx={cx} cy={cy} r={r} fill="none" stroke="#e8e4de" strokeWidth={thick} />
+      {paths.map((p, i) => (
+        <path key={i} d={p.d} fill="none" stroke={p.color} strokeWidth={thick} strokeLinecap="butt" opacity={0.8} />
+      ))}
+    </svg>
+  );
+}
+
+function LineChart({ data }: { data: NWPoint[] }) {
+  if (data.length < 2) return null;
+  const vals = data.map(d => d.val);
+  const min = Math.min(...vals), max = Math.max(...vals), range = max - min || 1;
+  const W = 500, H = 70, px = 10, py = 8;
+  const pts = data.map((d, i) => ({
+    x: px + (i / (data.length - 1)) * (W - px * 2),
+    y: py + (H - py * 2) - ((d.val - min) / range) * (H - py * 2),
+    m: d.m,
+  }));
+  const linePath = pts.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(' ');
+  const areaPath = `${linePath} L ${pts[pts.length - 1].x.toFixed(1)} ${H} L ${pts[0].x.toFixed(1)} ${H} Z`;
+  const growth = ((data[data.length - 1].val - data[0].val) / data[0].val * 100).toFixed(1);
+  return (
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 8 }}>
+        <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: '.09em', textTransform: 'uppercase', color: '#999' }}>
+          淨資產歷史（近 {data.length} 筆）
+        </div>
+        <div style={{ fontSize: 12, color: '#16a34a', fontWeight: 600 }}>+{growth}% ↑</div>
+      </div>
+      <svg width="100%" viewBox={`0 0 ${W} ${H + 14}`} style={{ display: 'block', overflow: 'visible' }}>
+        <defs>
+          <linearGradient id="nwGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="#1a1a1a" stopOpacity={0.07} />
+            <stop offset="100%" stopColor="#1a1a1a" stopOpacity={0} />
+          </linearGradient>
+        </defs>
+        <path d={areaPath} fill="url(#nwGrad)" />
+        <path d={linePath} fill="none" stroke="#1a1a1a" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" opacity={0.75} />
+        {pts.map((p, i) => (
+          <g key={i}>
+            <circle cx={p.x} cy={p.y} r={i === pts.length - 1 ? 4 : 2.5} fill="#1a1a1a" opacity={i === pts.length - 1 ? 0.9 : 0.45} />
+            <text x={p.x} y={H + 13} textAnchor="middle" style={{ fontSize: '10px', fill: '#aaa', fontFamily: "'DM Sans', system-ui" }}>{p.m}</text>
+          </g>
+        ))}
+      </svg>
+    </div>
+  );
+}
+
+// ── Dashboard ────────────────────────────────────────────
 export default function Dashboard() {
   const { data, loading, error, lastUpdated, refetch } = usePortfolioData();
-  const [tab, setTab] = useState('overview');
+
+  // Remember last tab across refreshes
+  const [tab, setTab] = useState(() => {
+    try { return localStorage.getItem('ios_dash_tab') || 'overview'; } catch { return 'overview'; }
+  });
+  const handleTab = (k: string) => {
+    setTab(k);
+    try { localStorage.setItem('ios_dash_tab', k); } catch {}
+  };
+
   const [mounted, setMounted] = useState(false);
   const [simRows, setSimRows] = useState<SimRow[]>([
     { mode: 'list', ticker: 'QQQM', shares: 5,  customTicker: '', customPrice: 0, customCurrency: 'USD' },
@@ -203,17 +303,46 @@ export default function Dashboard() {
   useEffect(() => { setTimeout(() => setMounted(true), 150); }, []);
   const c = compute(data);
 
+  // ── Loading: skeleton layout ──────────────────────────
   if (loading) return (
-    <div style={{ minHeight:'100vh', background:'#f7f6f3', display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', gap:16, fontFamily:'system-ui' }}>
-      <div style={{ width:32, height:32, border:'2.5px solid #e6e2dc', borderTop:'2.5px solid #1a1a1a', borderRadius:'50%', animation:'spin .8s linear infinite' }} />
-      <div style={{ fontSize:15, color:'#555' }}>載入數據中…</div>
-      <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
+    <div style={{ minHeight: '100vh', background: '#f7f6f3', fontFamily: "'DM Sans', system-ui" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Libre+Baskerville:wght@700&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600&display=swap');
+        *{box-sizing:border-box;margin:0;padding:0}
+        @keyframes shimmer{0%{background-position:-400px 0}100%{background-position:400px 0}}
+        .skeleton{background:linear-gradient(90deg,#ede9e3 25%,#f5f2ee 50%,#ede9e3 75%);background-size:800px 100%;animation:shimmer 1.4s ease-in-out infinite;border-radius:4px}
+      `}</style>
+      {/* Skeleton header */}
+      <div style={{ background: '#fff', borderBottom: '1px solid #e6e2dc', padding: '15px 16px 0' }}>
+        <div style={{ maxWidth: 960, margin: '0 auto' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', paddingBottom: 14 }}>
+            <div><Skeleton w={120} h={10} /><div style={{ marginTop: 8 }}><Skeleton w={200} h={20} /></div></div>
+            <div style={{ textAlign: 'right' }}><Skeleton w={80} h={10} /><div style={{ marginTop: 8 }}><Skeleton w={160} h={22} /></div></div>
+          </div>
+          <div style={{ display: 'flex', gap: 4, paddingBottom: 2 }}>
+            {[80, 60, 80, 60, 60].map((w, i) => <Skeleton key={i} w={w} h={14} r={3} />)}
+          </div>
+        </div>
+      </div>
+      {/* Skeleton body */}
+      <div style={{ maxWidth: 960, margin: '0 auto', padding: '16px 16px 80px', display: 'grid', gap: 12 }}>
+        <SkeletonCard lines={1} />
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5,1fr)', gap: 10 }}>
+          {[0,1,2,3,4].map(i => <SkeletonCard key={i} />)}
+        </div>
+        <SkeletonCard lines={2} />
+        <SkeletonCard lines={2} />
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+          <SkeletonCard lines={3} /><SkeletonCard lines={3} />
+        </div>
+      </div>
     </div>
   );
+
   if (error) return (
-    <div style={{ minHeight:'100vh', background:'#f7f6f3', display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', gap:16, fontFamily:'system-ui', padding:32 }}>
-      <div style={{ color:'#dc2626', fontSize:15 }}>⚠ 無法載入：{error}</div>
-      <button onClick={refetch} style={{ padding:'10px 24px', background:'#1a1a1a', color:'#fff', border:'none', borderRadius:4, cursor:'pointer', fontSize:15 }}>重試</button>
+    <div style={{ minHeight: '100vh', background: '#f7f6f3', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 16, fontFamily: 'system-ui', padding: 32 }}>
+      <div style={{ color: '#dc2626', fontSize: 15 }}>⚠ 無法載入：{error}</div>
+      <button onClick={refetch} style={{ padding: '10px 24px', background: '#1a1a1a', color: '#fff', border: 'none', borderRadius: 4, cursor: 'pointer', fontSize: 15 }}>重試</button>
     </div>
   );
   if (!c) return null;
@@ -268,8 +397,11 @@ export default function Dashboard() {
   const simNewAW: Record<string, number> = { ...c.awCur };
   simResults.forEach(r => { if (r.category) simNewAW[r.category] = (simNewAW[r.category] || 0) + r.buyAmt; });
 
+  // AW donut segments
+  const awSegs = c.awRows.map(r => ({ val: r.cur, color: CAT_COLOR[r.cat] }));
+
   return (
-    <div style={{ minHeight:'100vh', background:'#f7f6f3', fontFamily:"'DM Sans', system-ui", color:'#1a1a1a' }}>
+    <div style={{ minHeight: '100vh', background: '#f7f6f3', fontFamily: "'DM Sans', system-ui", color: '#1a1a1a' }}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Libre+Baskerville:wght@700&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600&display=swap');
         *{box-sizing:border-box;margin:0;padding:0}
@@ -277,6 +409,12 @@ export default function Dashboard() {
         ::-webkit-scrollbar{width:4px}::-webkit-scrollbar-thumb{background:#ddd;border-radius:2px}
         .serif{font-family:'Libre Baskerville',Georgia,serif}
         .card{background:#fff;border:1px solid #e6e2dc;border-radius:6px;padding:20px;box-shadow:0 1px 4px rgba(0,0,0,.05)}
+        .card-hover{transition:box-shadow .2s,transform .2s}
+        .card-hover:hover{box-shadow:0 4px 16px rgba(0,0,0,.09)!important;transform:translateY(-1px)}
+        .row-hover{transition:background .15s;border-radius:4px}
+        .row-hover:hover{background:#faf9f7}
+        @keyframes shimmer{0%{background-position:-400px 0}100%{background-position:400px 0}}
+        .skeleton{background:linear-gradient(90deg,#ede9e3 25%,#f5f2ee 50%,#ede9e3 75%);background-size:800px 100%;animation:shimmer 1.4s ease-in-out infinite;border-radius:4px}
         .lbl{font-size:11px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;color:#666;margin-bottom:10px}
         .tab-btn{font-size:13px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;padding:14px 16px;border:none;background:none;cursor:pointer;color:#666;border-bottom:2.5px solid transparent;transition:all .2s;white-space:nowrap}
         .tab-btn.active{color:#1a1a1a;border-bottom-color:#1a1a1a}
@@ -306,292 +444,317 @@ export default function Dashboard() {
       `}</style>
 
       {/* Header */}
-      <div style={{ background:'#fff', borderBottom:'1px solid #e6e2dc', position:'sticky', top:0, zIndex:100 }}>
-        <div style={{ maxWidth:960, margin:'0 auto', padding:'0 16px' }}>
-          <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', padding:'15px 0 0', gap:12 }}>
+      <div style={{ background: '#fff', borderBottom: '1px solid #e6e2dc', position: 'sticky', top: 0, zIndex: 100 }}>
+        <div style={{ maxWidth: 960, margin: '0 auto', padding: '0 16px' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', padding: '15px 0 0', gap: 12 }}>
             <div>
-              <div style={{ fontSize:10, letterSpacing:'.14em', textTransform:'uppercase', color:'#999', marginBottom:3 }}>Investment OS · Live</div>
-              <div className="serif" style={{ fontSize:20, fontWeight:700, lineHeight:1.2 }}>Portfolio Dashboard</div>
+              <div style={{ fontSize: 10, letterSpacing: '.14em', textTransform: 'uppercase', color: '#999', marginBottom: 3 }}>Investment OS · Live</div>
+              <div className="serif" style={{ fontSize: 20, fontWeight: 700, lineHeight: 1.2 }}>Portfolio Dashboard</div>
             </div>
-            <div style={{ textAlign:'right', flexShrink:0 }}>
-              <div style={{ fontSize:10, color:'#999', textTransform:'uppercase', letterSpacing:'.08em', marginBottom:2 }}>Total Net Worth</div>
-              <div className="serif" style={{ fontSize:22, fontWeight:700 }}>{fmtTWD(c.netWorth)}</div>
-              <div style={{ display:'flex', alignItems:'center', gap:8, justifyContent:'flex-end', marginTop:3 }}>
-                <span style={{ fontSize:10, color:'#999' }}>USD/TWD {c.fx.toFixed(2)} · {lastUpdated?.toLocaleTimeString('zh-TW',{hour:'2-digit',minute:'2-digit'})}</span>
-                <button onClick={refetch} style={{ background:'none', border:'1.5px solid #e6e2dc', borderRadius:4, padding:'4px 10px', fontSize:12, fontWeight:600, color:'#555', cursor:'pointer' }}>↻</button>
+            <div style={{ textAlign: 'right', flexShrink: 0 }}>
+              <div style={{ fontSize: 10, color: '#999', textTransform: 'uppercase', letterSpacing: '.08em', marginBottom: 2 }}>Total Net Worth</div>
+              <div className="serif" style={{ fontSize: 22, fontWeight: 700 }}>{fmtTWD(c.netWorth)}</div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, justifyContent: 'flex-end', marginTop: 3 }}>
+                <span style={{ fontSize: 10, color: '#999' }}>USD/TWD {c.fx.toFixed(2)} · {lastUpdated?.toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit' })}</span>
+                <button onClick={refetch} style={{ background: 'none', border: '1.5px solid #e6e2dc', borderRadius: 4, padding: '4px 10px', fontSize: 12, fontWeight: 600, color: '#555', cursor: 'pointer' }}>↻</button>
               </div>
             </div>
           </div>
-          <div style={{ display:'flex', overflowX:'auto', marginTop:2, WebkitOverflowScrolling:'touch' }}>
-            {TABS.map(([k,v]) => <button key={k} className={`tab-btn ${tab===k?'active':''}`} onClick={()=>setTab(k)}>{v}</button>)}
+          <div style={{ display: 'flex', overflowX: 'auto', marginTop: 2, WebkitOverflowScrolling: 'touch' }}>
+            {TABS.map(([k, v]) => (
+              <button key={k} className={`tab-btn ${tab === k ? 'active' : ''}`} onClick={() => handleTab(k)}>{v}</button>
+            ))}
           </div>
         </div>
       </div>
 
-      <div style={{ maxWidth:960, margin:'0 auto', padding:'16px 16px 80px' }}>
+      <div style={{ maxWidth: 960, margin: '0 auto', padding: '16px 16px 80px' }}>
 
-        {/* 警示：直接顯示，不收起 */}
+        {/* Warnings */}
         {c.warns.length > 0 && (
-          <div style={{ display:'flex', flexDirection:'column', gap:6, marginBottom:14 }}>
-            {c.warns.map((w,i) => <div key={i} className="wc">⚠ {w}</div>)}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 14 }}>
+            {c.warns.map((w, i) => <div key={i} className="wc">⚠ {w}</div>)}
           </div>
         )}
 
         {/* OVERVIEW */}
         {tab === 'overview' && (
-          <div className="fu" style={{ display:'grid', gap:12 }}>
+          <div className="fu" style={{ display: 'grid', gap: 12 }}>
 
-            {/* 經濟象限 + 匯率 — 完整顯示 */}
-            <div className="card" style={{ padding:'12px 18px' }}>
-              <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', flexWrap:'wrap', gap:10 }}>
-                {/* 左：象限指標 */}
-                <div style={{ display:'flex', alignItems:'center', gap:12, flexWrap:'wrap' }}>
-                  <div style={{ fontSize:11, color:'#999', fontWeight:700, letterSpacing:'.08em', textTransform:'uppercase' }}>經濟象限</div>
-                  {/* 成長方向 */}
+            {/* Economic quadrant */}
+            <div className="card card-hover" style={{ padding: '12px 18px' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 10 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+                  <div style={{ fontSize: 11, color: '#999', fontWeight: 700, letterSpacing: '.08em', textTransform: 'uppercase' }}>經濟象限</div>
                   {c.growthS && (
-                    <div style={{ display:'flex', alignItems:'center', gap:4 }}>
-                      <span style={{ fontSize:11, color:'#777' }}>成長</span>
-                      <span style={{ fontSize:14, fontWeight:700, color: c.growthS === '↑' ? '#16a34a' : '#dc2626' }}>{c.growthS}</span>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                      <span style={{ fontSize: 11, color: '#777' }}>成長</span>
+                      <span style={{ fontSize: 14, fontWeight: 700, color: c.growthS === '↑' ? '#16a34a' : '#dc2626' }}>{c.growthS}</span>
                     </div>
                   )}
-                  {/* 通膨方向 */}
                   {c.inflS && (
-                    <div style={{ display:'flex', alignItems:'center', gap:4 }}>
-                      <span style={{ fontSize:11, color:'#777' }}>通膨</span>
-                      <span style={{ fontSize:14, fontWeight:700, color: c.inflS === '↑' ? '#dc2626' : '#16a34a' }}>{c.inflS}</span>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                      <span style={{ fontSize: 11, color: '#777' }}>通膨</span>
+                      <span style={{ fontSize: 14, fontWeight: 700, color: c.inflS === '↑' ? '#dc2626' : '#16a34a' }}>{c.inflS}</span>
                     </div>
                   )}
-                  {/* 象限 */}
-                  <div style={{ fontSize:14, fontWeight:700 }}>{c.quadrant}</div>
-                  {/* 確認狀態 */}
+                  <div style={{ fontSize: 14, fontWeight: 700 }}>{c.quadrant}</div>
                   {c.quadConfirm && (
                     <span style={{
-                      fontSize:11, padding:'2px 8px', borderRadius:3, fontWeight:600,
+                      fontSize: 11, padding: '2px 8px', borderRadius: 3, fontWeight: 600,
                       background: c.quadConfirm.includes('確認') ? '#f0fdf4' : '#fefce8',
-                      color:      c.quadConfirm.includes('確認') ? '#16a34a' : '#a16207',
-                      border:     `1px solid ${c.quadConfirm.includes('確認') ? '#bbf7d0' : '#fde68a'}`,
+                      color: c.quadConfirm.includes('確認') ? '#16a34a' : '#a16207',
+                      border: `1px solid ${c.quadConfirm.includes('確認') ? '#bbf7d0' : '#fde68a'}`,
                     }}>{c.quadConfirm}</span>
                   )}
                 </div>
-                {/* 右：匯率 + Stress */}
-                <div style={{ display:'flex', alignItems:'center', gap:14 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
                   {c.fxTrend && (
-                    <div style={{ textAlign:'right' }}>
-                      <div style={{ fontSize:10, color:'#999', marginBottom:2 }}>匯率趨勢（90天）</div>
-                      <div style={{ fontSize:13, fontWeight:600, color: c.fxTrend.includes('貶') ? '#dc2626' : '#2563eb' }}>{c.fxTrend}</div>
+                    <div style={{ textAlign: 'right' }}>
+                      <div style={{ fontSize: 10, color: '#999', marginBottom: 2 }}>匯率趨勢（90天）</div>
+                      <div style={{ fontSize: 13, fontWeight: 600, color: c.fxTrend.includes('貶') ? '#dc2626' : '#2563eb' }}>{c.fxTrend}</div>
                     </div>
                   )}
-                  <div style={{ fontSize:13 }}>{c.stressStatus}</div>
+                  <div style={{ fontSize: 13 }}>{c.stressStatus}</div>
                 </div>
               </div>
             </div>
 
-            {/* KPIs — 桌面5格 */}
-            <div className="g5" style={{ display:'grid', gap:10 }}>
+            {/* KPI 5-grid */}
+            <div className="g5" style={{ display: 'grid', gap: 10 }}>
               {[
-                { lbl:'可投資基礎', val:fmtTWD(c.base),  sub:'Cash + Investment' },
-                { lbl:'未實現損益', val:`${c.totPnL>=0?'+':''}${fmtTWD(c.totPnL)}`, sub:'所有持倉', green:c.totPnL>0, red:c.totPnL<0 },
-                { lbl:'月被動收益', val:fmtTWD(c.monthly), sub:'利息＋股息（估）' },
-                { lbl:'目標達成率', val:fmtPct(c.goalPct), sub:`目標 ${fmtTWD(c.targetNW)}` },
-                { lbl:'年化收益率', val:fmtPct(c.annYield), sub:'被動收益 / 可投資基礎' },
-              ].map((k,i) => (
-                <div key={i} className="card" style={{ padding:'14px 16px' }}>
-                  <div className="lbl" style={{ marginBottom:6 }}>{k.lbl}</div>
-                  <div className="serif" style={{ fontSize:16, fontWeight:700, color:(k as {green?:boolean;red?:boolean}).green?'#16a34a':(k as {green?:boolean;red?:boolean}).red?'#dc2626':'#1a1a1a', lineHeight:1.3 }}>{k.val}</div>
-                  <div style={{ fontSize:11, color:'#888', marginTop:3 }}>{k.sub}</div>
+                { lbl: '可投資基礎', val: fmtTWD(c.base), sub: 'Cash + Investment' },
+                { lbl: '未實現損益', val: `${c.totPnL >= 0 ? '+' : ''}${fmtTWD(c.totPnL)}`, sub: '所有持倉', green: c.totPnL > 0, red: c.totPnL < 0 },
+                { lbl: '月被動收益', val: fmtTWD(c.monthly), sub: '利息＋股息（估）' },
+                { lbl: '目標達成率', val: fmtPct(c.goalPct), sub: `目標 ${fmtTWD(c.targetNW)}` },
+                { lbl: '年化收益率', val: fmtPct(c.annYield), sub: '被動收益 / 可投資基礎' },
+              ].map((k, i) => (
+                <div key={i} className="card card-hover" style={{ padding: '14px 16px' }}>
+                  <div className="lbl" style={{ marginBottom: 6 }}>{k.lbl}</div>
+                  <div className="serif" style={{ fontSize: 16, fontWeight: 700, color: (k as {green?:boolean;red?:boolean}).green ? '#16a34a' : (k as {green?:boolean;red?:boolean}).red ? '#dc2626' : '#1a1a1a', lineHeight: 1.3 }}>{k.val}</div>
+                  <div style={{ fontSize: 11, color: '#888', marginTop: 3 }}>{k.sub}</div>
                 </div>
               ))}
             </div>
 
-            {/* Goal */}
-            <div className="card" style={{ padding:'14px 18px' }}>
-              <div style={{ display:'flex', justifyContent:'space-between', marginBottom:9, alignItems:'flex-end' }}>
+            {/* Goal progress */}
+            <div className="card card-hover" style={{ padding: '14px 18px' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 9, alignItems: 'flex-end' }}>
                 <div>
-                  <div className="lbl" style={{ marginBottom:2 }}>目標淨資產進度</div>
-                  <div style={{ fontSize:13, color:'#555' }}>{fmtTWD(c.netWorth)} <span style={{ color:'#bbb' }}>/ {fmtTWD(c.targetNW)}</span></div>
+                  <div className="lbl" style={{ marginBottom: 2 }}>目標淨資產進度</div>
+                  <div style={{ fontSize: 13, color: '#555' }}>{fmtTWD(c.netWorth)} <span style={{ color: '#bbb' }}>/ {fmtTWD(c.targetNW)}</span></div>
                 </div>
-                <div style={{ textAlign:'right' }}>
-                  <div className="serif" style={{ fontSize:20, fontWeight:700 }}>{fmtPct(c.goalPct)}</div>
-                  <div style={{ fontSize:11, color:'#999' }}>{c.estMonths ? `預估 ${c.estMonths} 個月達成` : '計算中'}</div>
+                <div style={{ textAlign: 'right' }}>
+                  <div className="serif" style={{ fontSize: 20, fontWeight: 700 }}>{fmtPct(c.goalPct)}</div>
+                  <div style={{ fontSize: 11, color: '#999' }}>{c.estMonths ? `預估 ${c.estMonths} 個月達成` : '計算中'}</div>
                 </div>
               </div>
-              <div className="bar" style={{ height:7 }}>
-                <div className="bf" style={{ width:mounted?`${Math.min(c.goalPct,1)*100}%`:'0%', background:'#1a1a1a', opacity:.8 }} />
+              <div className="bar" style={{ height: 7 }}>
+                <div className="bf" style={{ width: mounted ? `${Math.min(c.goalPct, 1) * 100}%` : '0%', background: '#1a1a1a', opacity: .8 }} />
               </div>
             </div>
 
-            <div className="g2" style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:12 }}>
-              {/* All Weather */}
-              <div className="card">
-                <div className="lbl">All Weather 配置</div>
-                {c.awRows.map((r,i) => (
-                  <div key={i} style={{ marginBottom:i<2?18:0 }}>
-                    <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:6 }}>
-                      <div style={{ display:'flex', alignItems:'center', gap:7 }}>
-                        <div style={{ width:7, height:7, borderRadius:'50%', background:CAT_COLOR[r.cat] }} />
-                        <span style={{ fontSize:14, fontWeight:600 }}>{r.cat}</span>
-                        <span className={`bdg ${r.gap>0.01?'buy':r.gap<-0.01?'over':'ok'}`}>{r.gap>0.01?'BUY':r.gap<-0.01?'OVER':'OK'}</span>
-                      </div>
-                      <span style={{ fontSize:12, color:'#555' }}>{fmtPct(r.cur)} <span style={{ color:'#bbb' }}>/ {fmtPct(r.tgt)}</span></span>
-                    </div>
-                    <div className="bar"><div className="bf" style={{ width:mounted?`${Math.min(r.cur/r.tgt,1)*100}%`:'0%', background:CAT_COLOR[r.cat], opacity:.7 }} /></div>
-                    <div style={{ fontSize:11, color:'#777', marginTop:4 }}>{r.gap>0?`缺口 ${fmtTWD(r.gapAmt)}`:`超配 ${fmtPct(Math.abs(r.gap))}`}</div>
-                  </div>
-                ))}
+            {/* Net worth history chart */}
+            {c.nwHistory.length >= 2 && (
+              <div className="card card-hover" style={{ padding: '14px 18px' }}>
+                <LineChart data={c.nwHistory} />
               </div>
+            )}
 
-              {/* Right */}
-              <div style={{ display:'grid', gap:12 }}>
-                <div className="card">
-                  <div className="lbl">台美資產分布</div>
-                  {[
-                    { lbl:'台幣資產', val:c.twdTotal, pct:c.twdPct, color:'#2563eb' },
-                    { lbl:'美元資產', val:c.usdTotal, pct:c.usdPct, color:'#d97706' },
-                  ].map((r,i) => (
-                    <div key={i} style={{ marginBottom:i===0?12:0 }}>
-                      <div style={{ display:'flex', justifyContent:'space-between', marginBottom:5 }}>
-                        <span style={{ fontSize:13, fontWeight:500 }}>{r.lbl}</span>
-                        <span style={{ fontSize:12, color:'#555' }}>{fmtPct(r.pct)}</span>
-                      </div>
-                      <div className="bar"><div className="bf" style={{ width:mounted?`${r.pct*100}%`:'0%', background:r.color, opacity:.65 }} /></div>
-                      <div style={{ fontSize:11, color:'#777', marginTop:3 }}>{fmtTWD(r.val)}</div>
+            {/* AW + right panels */}
+            <div className="g2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+              {/* All Weather with donut */}
+              <div className="card card-hover">
+                <div className="lbl">All Weather 配置</div>
+                <div style={{ display: 'flex', gap: 16, alignItems: 'center' }}>
+                  {/* Donut */}
+                  <div style={{ flexShrink: 0, position: 'relative', width: 110, height: 110 }}>
+                    <DonutChart segs={awSegs} size={110} thick={16} />
+                    <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}>
+                      <div style={{ fontSize: 9, color: '#999', fontWeight: 700, letterSpacing: '.06em', textTransform: 'uppercase' }}>Total</div>
+                      <div className="serif" style={{ fontSize: 12, fontWeight: 700 }}>100%</div>
                     </div>
-                  ))}
-                </div>
-                <div className="card">
-                  <div className="lbl">被動收益（估算）</div>
-                  <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:10, marginBottom:10 }}>
-                    {[{lbl:'利息/yr',v:c.annInt},{lbl:'股息/yr',v:c.annDiv}].map((r,i) => (
+                  </div>
+                  {/* Bars */}
+                  <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 14 }}>
+                    {c.awRows.map((r, i) => (
                       <div key={i}>
-                        <div style={{ fontSize:11, color:'#777', marginBottom:3 }}>{r.lbl}</div>
-                        <div className="serif" style={{ fontSize:14, fontWeight:700 }}>{fmtTWD(r.v)}</div>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 5 }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                            <div style={{ width: 6, height: 6, borderRadius: '50%', background: CAT_COLOR[r.cat] }} />
+                            <span style={{ fontSize: 13, fontWeight: 600 }}>{r.cat}</span>
+                            <span className={`bdg ${r.gap > 0.01 ? 'buy' : r.gap < -0.01 ? 'over' : 'ok'}`}>
+                              {r.gap > 0.01 ? 'BUY' : r.gap < -0.01 ? 'OVER' : 'OK'}
+                            </span>
+                          </div>
+                          <span style={{ fontSize: 11, color: '#555' }}>{fmtPct(r.cur)} <span style={{ color: '#bbb' }}>/ {fmtPct(r.tgt)}</span></span>
+                        </div>
+                        <div className="bar">
+                          <div className="bf" style={{ width: mounted ? `${Math.min(r.cur / r.tgt, 1) * 100}%` : '0%', background: CAT_COLOR[r.cat], opacity: .7 }} />
+                        </div>
+                        <div style={{ fontSize: 10, color: '#777', marginTop: 3 }}>{r.gap > 0 ? `缺口 ${fmtTWD(r.gapAmt)}` : `超配 ${fmtPct(Math.abs(r.gap))}`}</div>
                       </div>
                     ))}
                   </div>
-                  <div style={{ fontSize:11, color:'#777', marginBottom:3 }}>月被動收益</div>
-                  <div className="serif" style={{ fontSize:17, fontWeight:700 }}>{fmtTWD(c.monthly)}</div>
+                </div>
+              </div>
+
+              <div style={{ display: 'grid', gap: 12 }}>
+                {/* Currency split */}
+                <div className="card card-hover">
+                  <div className="lbl">台美資產分布</div>
+                  {[
+                    { lbl: '台幣資產', val: c.twdTotal, pct: c.twdPct, color: '#2563eb' },
+                    { lbl: '美元資產', val: c.usdTotal, pct: c.usdPct, color: '#d97706' },
+                  ].map((r, i) => (
+                    <div key={i} style={{ marginBottom: i === 0 ? 12 : 0 }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 5 }}>
+                        <span style={{ fontSize: 13, fontWeight: 500 }}>{r.lbl}</span>
+                        <span style={{ fontSize: 12, color: '#555' }}>{fmtPct(r.pct)}</span>
+                      </div>
+                      <div className="bar">
+                        <div className="bf" style={{ width: mounted ? `${r.pct * 100}%` : '0%', background: r.color, opacity: .65 }} />
+                      </div>
+                      <div style={{ fontSize: 11, color: '#777', marginTop: 3 }}>{fmtTWD(r.val)}</div>
+                    </div>
+                  ))}
+                </div>
+                {/* Passive income */}
+                <div className="card card-hover">
+                  <div className="lbl">被動收益（估算）</div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 10 }}>
+                    {[{ lbl: '利息/yr', v: c.annInt }, { lbl: '股息/yr', v: c.annDiv }].map((r, i) => (
+                      <div key={i}>
+                        <div style={{ fontSize: 11, color: '#777', marginBottom: 3 }}>{r.lbl}</div>
+                        <div className="serif" style={{ fontSize: 14, fontWeight: 700 }}>{fmtTWD(r.v)}</div>
+                      </div>
+                    ))}
+                  </div>
+                  <div style={{ fontSize: 11, color: '#777', marginBottom: 3 }}>月被動收益</div>
+                  <div className="serif" style={{ fontSize: 17, fontWeight: 700 }}>{fmtTWD(c.monthly)}</div>
                 </div>
               </div>
             </div>
 
-            {/* Monthly */}
-            {(c.monthSalary>0||c.monthBonus>0||c.monthDividend>0||c.monthOther>0) && (
-              <div className="card">
+            {/* Monthly inflows */}
+            {(c.monthSalary > 0 || c.monthBonus > 0 || c.monthDividend > 0 || c.monthOther > 0) && (
+              <div className="card card-hover">
                 <div className="lbl">本月資金流入</div>
-                <div className="g4" style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:12 }}>
-                  {[{lbl:'薪資',v:c.monthSalary},{lbl:'獎金',v:c.monthBonus},{lbl:'股息實收',v:c.monthDividend},{lbl:'其他',v:c.monthOther}].map((r,i) => (
+                <div className="g4" style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 12 }}>
+                  {[{ lbl: '薪資', v: c.monthSalary }, { lbl: '獎金', v: c.monthBonus }, { lbl: '股息實收', v: c.monthDividend }, { lbl: '其他', v: c.monthOther }].map((r, i) => (
                     <div key={i}>
-                      <div style={{ fontSize:11, color:'#777', marginBottom:4 }}>{r.lbl}</div>
-                      <div className="serif" style={{ fontSize:14, fontWeight:700, color:r.v>0?'#1a1a1a':'#ccc' }}>{r.v>0?fmtTWD(r.v):'—'}</div>
+                      <div style={{ fontSize: 11, color: '#777', marginBottom: 4 }}>{r.lbl}</div>
+                      <div className="serif" style={{ fontSize: 14, fontWeight: 700, color: r.v > 0 ? '#1a1a1a' : '#ccc' }}>{r.v > 0 ? fmtTWD(r.v) : '—'}</div>
                     </div>
                   ))}
                 </div>
               </div>
             )}
 
-            <div style={{ fontSize:10, color:'#ccc', textAlign:'right' }}>股價來源：Google Sheets GOOGLEFINANCE · 約 15-20 分鐘更新</div>
+            <div style={{ fontSize: 10, color: '#ccc', textAlign: 'right' }}>股價來源：Google Sheets GOOGLEFINANCE · 約 15-20 分鐘更新</div>
           </div>
         )}
 
         {/* POSITIONS */}
         {tab === 'positions' && (
-          <div className="fu card">
+          <div className="fu card card-hover">
             <div className="lbl">持倉明細</div>
-            <div className="ptable" style={{ display:'grid', gridTemplateColumns:'80px 1fr 96px 88px 56px', gap:8, paddingBottom:9, borderBottom:'2px solid #f0ede8' }}>
-              {['Ticker','名稱 / 詳情','市值','損益','報酬%'].map(h => (
-                <div key={h} style={{ fontSize:10, fontWeight:700, letterSpacing:'.07em', textTransform:'uppercase', color:'#888' }}>{h}</div>
+            <div className="ptable" style={{ display: 'grid', gridTemplateColumns: '80px 1fr 90px 74px 54px', gap: 8, paddingBottom: 9, borderBottom: '2px solid #f0ede8' }}>
+              {['Ticker', '名稱 / 詳情', '市值', '損益', '報酬%'].map(h => (
+                <div key={h} style={{ fontSize: 10, fontWeight: 700, letterSpacing: '.07em', textTransform: 'uppercase', color: '#888' }}>{h}</div>
               ))}
             </div>
-            {c.positions.map((p,i) => (
-              <div key={i} className="ptable" style={{ display:'grid', gridTemplateColumns:'80px 1fr 96px 88px 56px', gap:8, alignItems:'center', padding:'11px 0', borderBottom:'1px solid #f0ede8' }}>
+            {c.positions.map((p, i) => (
+              <div key={i} className="ptable row-hover" style={{ display: 'grid', gridTemplateColumns: '80px 1fr 90px 74px 54px', gap: 8, alignItems: 'center', padding: '11px 4px', borderBottom: '1px solid #f0ede8' }}>
                 <div>
-                  <div style={{ fontSize:14, fontWeight:700 }}>{p.ticker}</div>
-                  <div style={{ fontSize:10, color:CAT_COLOR[p.category], marginTop:2, fontWeight:700 }}>{p.category}</div>
+                  <div style={{ fontSize: 14, fontWeight: 700 }}>{p.ticker}</div>
+                  <div style={{ fontSize: 10, color: CAT_COLOR[p.category], marginTop: 2, fontWeight: 700 }}>{p.category}</div>
                 </div>
                 <div>
-                  <div style={{ fontSize:13, color:'#222' }}>{p.name}</div>
-                  <div style={{ fontSize:11, color:'#888', marginTop:2 }}>
+                  <div style={{ fontSize: 13, color: '#222' }}>{p.name}</div>
+                  <div style={{ fontSize: 11, color: '#888', marginTop: 2 }}>
                     {p.sh.toLocaleString()} 股 · 均 {fmtNum(p.avgCost)} {p.currency}
-                    {p.cp>0 && <span style={{ marginLeft:5 }}>· 現 {fmtNum(p.cp)}</span>}
-                    <span style={{ marginLeft:5, color:'#bbb' }}>· {fmtPct(p.portPct)}</span>
+                    {p.cp > 0 && <span style={{ marginLeft: 5 }}>· 現 {fmtNum(p.cp)}</span>}
+                    <span style={{ marginLeft: 5, color: '#bbb' }}>· {fmtPct(p.portPct)}</span>
                   </div>
                 </div>
-                <div className="serif" style={{ fontSize:13, fontWeight:700 }}>{fmtTWD(p.mvTWD)}</div>
-                <div className="serif" style={{ fontSize:13, fontWeight:700, color:p.pnlTWD>=0?'#16a34a':'#dc2626' }}>
-                  {p.pnlTWD>=0?'+':''}{fmtTWD(p.pnlTWD)}
+                <div className="serif" style={{ fontSize: 13, fontWeight: 700 }}>{fmtTWD(p.mvTWD)}</div>
+                <div className="serif" style={{ fontSize: 13, fontWeight: 700, color: p.pnlTWD >= 0 ? '#16a34a' : '#dc2626' }}>
+                  {p.pnlTWD >= 0 ? '+' : ''}{fmtTWD(p.pnlTWD)}
                 </div>
-                <div style={{ fontSize:13, color:p.ret>=0?'#16a34a':'#dc2626', fontWeight:700 }}>
-                  {p.ret>=0?'+':''}{fmtPct(p.ret)}
+                <div style={{ fontSize: 13, color: p.ret >= 0 ? '#16a34a' : '#dc2626', fontWeight: 700 }}>
+                  {p.ret >= 0 ? '+' : ''}{fmtPct(p.ret)}
                 </div>
               </div>
             ))}
-            <div style={{ display:'flex', justifyContent:'space-between', paddingTop:12, borderTop:'2px solid #f0ede8', marginTop:2 }}>
-              <span style={{ fontSize:13, color:'#555', fontWeight:600 }}>總投資市值</span>
-              <span className="serif" style={{ fontSize:16, fontWeight:700 }}>{fmtTWD(c.totInv)}</span>
+            <div style={{ display: 'flex', justifyContent: 'space-between', paddingTop: 12, borderTop: '2px solid #f0ede8', marginTop: 2 }}>
+              <span style={{ fontSize: 13, color: '#555', fontWeight: 600 }}>總投資市值</span>
+              <span className="serif" style={{ fontSize: 16, fontWeight: 700 }}>{fmtTWD(c.totInv)}</span>
             </div>
           </div>
         )}
 
         {/* REBALANCE */}
         {tab === 'rebalance' && (
-          <div className="fu" style={{ display:'grid', gap:12 }}>
-
+          <div className="fu" style={{ display: 'grid', gap: 12 }}>
             {/* Step 1 DCA */}
-            <div className="card">
-              <div style={{ display:'flex', alignItems:'center', gap:10, marginBottom:14 }}>
-                <span className="step-tag" style={{ background:'#1a1a1a', color:'#fff' }}>Step 1</span>
-                <div className="lbl" style={{ marginBottom:0 }}>月定投計劃（{fmtTWD(c.fixedDCA)}）</div>
-                <span style={{ fontSize:11, color:'#999' }}>固定執行，不受象限影響</span>
+            <div className="card card-hover">
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14 }}>
+                <span className="step-tag" style={{ background: '#1a1a1a', color: '#fff' }}>Step 1</span>
+                <div className="lbl" style={{ marginBottom: 0 }}>月定投計劃（{fmtTWD(c.fixedDCA)}）</div>
+                <span style={{ fontSize: 11, color: '#999' }}>固定執行，不受象限影響</span>
               </div>
-              {c.dcaPlan.map((d,i) => (
-                <div key={i} style={{ display:'flex', justifyContent:'space-between', alignItems:'center', padding:'11px 0', borderBottom:i<c.dcaPlan.length-1?'1px solid #f0ede8':'none' }}>
-                  <div style={{ display:'flex', alignItems:'center', gap:10 }}>
+              {c.dcaPlan.map((d, i) => (
+                <div key={i} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '11px 0', borderBottom: i < c.dcaPlan.length - 1 ? '1px solid #f0ede8' : 'none' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                     <span className="bdg buy">DCA</span>
                     <div>
-                      <div style={{ fontSize:15, fontWeight:700 }}>{d.ticker}</div>
-                      <div style={{ fontSize:12, color:'#666', marginTop:2 }}>
-                        {d.name} · <strong style={{ color:'#1a1a1a' }}>{d.shares} 股</strong> · 預算 {fmtTWD(d.budget)}
-                        {d.cp>0 && <span style={{ color:'#999', marginLeft:5 }}>· 現價 {fmtNum(d.cp,0)}</span>}
+                      <div style={{ fontSize: 15, fontWeight: 700 }}>{d.ticker}</div>
+                      <div style={{ fontSize: 12, color: '#666', marginTop: 2 }}>
+                        {d.name} · <strong style={{ color: '#1a1a1a' }}>{d.shares} 股</strong> · 預算 {fmtTWD(d.budget)}
+                        {d.cp > 0 && <span style={{ color: '#999', marginLeft: 5 }}>· 現價 {fmtNum(d.cp, 0)}</span>}
                       </div>
                     </div>
                   </div>
-                  <div style={{ textAlign:'right' }}>
-                    <div className="serif" style={{ fontSize:14, fontWeight:700 }}>{fmtTWD(d.amt)}</div>
-                    <div style={{ fontSize:11, color:'#bbb', marginTop:2 }}>殘差 {fmtTWD(d.residual)}</div>
+                  <div style={{ textAlign: 'right' }}>
+                    <div className="serif" style={{ fontSize: 14, fontWeight: 700 }}>{fmtTWD(d.amt)}</div>
+                    <div style={{ fontSize: 11, color: '#bbb', marginTop: 2 }}>殘差 {fmtTWD(d.residual)}</div>
                   </div>
                 </div>
               ))}
             </div>
 
             {/* Step 2 AW Gap */}
-            <div className="card">
-              <div style={{ display:'flex', alignItems:'center', gap:10, marginBottom:6 }}>
-                <span className="step-tag" style={{ background:'#374151', color:'#fff' }}>Step 2</span>
-                <div className="lbl" style={{ marginBottom:0 }}>All Weather 缺口</div>
-                <span style={{ fontSize:11, color:'#999' }}>彈性執行，依缺口補足</span>
+            <div className="card card-hover">
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
+                <span className="step-tag" style={{ background: '#374151', color: '#fff' }}>Step 2</span>
+                <div className="lbl" style={{ marginBottom: 0 }}>All Weather 缺口</div>
+                <span style={{ fontSize: 11, color: '#999' }}>彈性執行，依缺口補足</span>
               </div>
-              <div style={{ fontSize:12, color:'#777', marginBottom:14 }}>可動用現金 {fmtTWD(c.avail)} · 象限：{c.quadrant}</div>
-              {c.awRows.map((r,i) => (
-                <div key={i} style={{ display:'flex', justifyContent:'space-between', alignItems:'center', padding:'12px 0', borderBottom:i<c.awRows.length-1?'1px solid #f0ede8':'none' }}>
-                  <div style={{ display:'flex', alignItems:'center', gap:10 }}>
-                    <div style={{ width:8, height:8, borderRadius:'50%', background:CAT_COLOR[r.cat] }} />
+              <div style={{ fontSize: 12, color: '#777', marginBottom: 14 }}>可動用現金 {fmtTWD(c.avail)} · 象限：{c.quadrant}</div>
+              {c.awRows.map((r, i) => (
+                <div key={i} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '12px 0', borderBottom: i < c.awRows.length - 1 ? '1px solid #f0ede8' : 'none' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                    <div style={{ width: 8, height: 8, borderRadius: '50%', background: CAT_COLOR[r.cat] }} />
                     <div>
-                      <div style={{ fontSize:14, fontWeight:600 }}>{r.cat}</div>
-                      <div style={{ fontSize:11, color:'#777', marginTop:2 }}>現況 {fmtPct(r.cur)} → 目標 {fmtPct(r.tgt)}</div>
+                      <div style={{ fontSize: 14, fontWeight: 600 }}>{r.cat}</div>
+                      <div style={{ fontSize: 11, color: '#777', marginTop: 2 }}>現況 {fmtPct(r.cur)} → 目標 {fmtPct(r.tgt)}</div>
                     </div>
                   </div>
-                  <div style={{ textAlign:'right' }}>
-                    <span className={`bdg ${r.gap>0.01?'buy':r.gap<-0.01?'over':'ok'}`}>{r.gap>0.01?'BUY':r.gap<-0.01?'OVER':'OK'}</span>
-                    <div className="serif" style={{ fontSize:14, fontWeight:700, marginTop:4, color:r.gap>0?'#16a34a':'#dc2626' }}>
-                      {r.gap>0?'+':''}{fmtTWD(r.gapAmt)}
+                  <div style={{ textAlign: 'right' }}>
+                    <span className={`bdg ${r.gap > 0.01 ? 'buy' : r.gap < -0.01 ? 'over' : 'ok'}`}>
+                      {r.gap > 0.01 ? 'BUY' : r.gap < -0.01 ? 'OVER' : 'OK'}
+                    </span>
+                    <div className="serif" style={{ fontSize: 14, fontWeight: 700, marginTop: 4, color: r.gap > 0 ? '#16a34a' : '#dc2626' }}>
+                      {r.gap > 0 ? '+' : ''}{fmtTWD(r.gapAmt)}
                     </div>
                   </div>
                 </div>
               ))}
             </div>
 
-            {/* Deployment — 修正：平均分配，不按 portPct */}
-            <div className="card">
+            {/* Deployment */}
+            <div className="card card-hover">
               <div className="lbl">戰略部署建議（{fmtTWD(c.deployAmt)}）</div>
               {(() => {
                 const suggestions = c.awRows
@@ -607,19 +770,19 @@ export default function Dashboard() {
                     }).filter(x => x.sh > 0);
                   });
                 if (suggestions.length === 0)
-                  return <div style={{ fontSize:13, color:'#bbb', padding:'8px 0' }}>目前無明顯缺口需要補足</div>;
-                return suggestions.map(({ p, sh, pTWD, amt }, i) => (
-                  <div key={i} style={{ display:'flex', justifyContent:'space-between', alignItems:'center', padding:'11px 0', borderBottom:'1px solid #f0ede8' }}>
-                    <div style={{ display:'flex', alignItems:'center', gap:10 }}>
+                  return <div style={{ fontSize: 13, color: '#bbb', padding: '8px 0' }}>目前無明顯缺口需要補足</div>;
+                return suggestions.map(({ p, sh, amt }, i) => (
+                  <div key={i} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '11px 0', borderBottom: '1px solid #f0ede8' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                       <span className="bdg buy">BUY</span>
                       <div>
-                        <div style={{ fontSize:14, fontWeight:700 }}>{p.ticker}</div>
-                        <div style={{ fontSize:12, color:'#666', marginTop:2 }}>
-                          {p.name} · <strong style={{ color:'#1a1a1a' }}>{sh} 股</strong> · {p.currency==='USD'?`$${fmtNum(p.cp)} USD`:`NT$ ${fmtNum(p.cp,0)}`}
+                        <div style={{ fontSize: 14, fontWeight: 700 }}>{p.ticker}</div>
+                        <div style={{ fontSize: 12, color: '#666', marginTop: 2 }}>
+                          {p.name} · <strong style={{ color: '#1a1a1a' }}>{sh} 股</strong> · {p.currency === 'USD' ? `$${fmtNum(p.cp)} USD` : `NT$ ${fmtNum(p.cp, 0)}`}
                         </div>
                       </div>
                     </div>
-                    <div className="serif" style={{ fontSize:14, fontWeight:700, color:'#16a34a' }}>{fmtTWD(amt)}</div>
+                    <div className="serif" style={{ fontSize: 14, fontWeight: 700, color: '#16a34a' }}>{fmtTWD(amt)}</div>
                   </div>
                 ));
               })()}
@@ -629,56 +792,54 @@ export default function Dashboard() {
 
         {/* SIMULATE */}
         {tab === 'simulate' && (
-          <div className="fu" style={{ display:'grid', gap:12 }}>
-            <div className="card">
-              <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:16 }}>
-                <div className="lbl" style={{ marginBottom:0 }}>多標的加倉模擬</div>
+          <div className="fu" style={{ display: 'grid', gap: 12 }}>
+            <div className="card card-hover">
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+                <div className="lbl" style={{ marginBottom: 0 }}>多標的加倉模擬</div>
                 <button className="bp" onClick={() => setSimRows(r => [...r, {
-                  mode:'list', ticker:c.tickers[0]?String(c.tickers[0].ticker):'',
-                  shares:10, customTicker:'', customPrice:0, customCurrency:'USD'
+                  mode: 'list', ticker: c.tickers[0] ? String(c.tickers[0].ticker) : '',
+                  shares: 10, customTicker: '', customPrice: 0, customCurrency: 'USD'
                 }])}>＋ 新增</button>
               </div>
-
-              <div style={{ background:'#faf9f7', border:'1px solid #e6e2dc', borderRadius:4, padding:'10px 14px', marginBottom:16 }}>
-                <div style={{ fontSize:10, fontWeight:700, letterSpacing:'.09em', textTransform:'uppercase', color:'#888', marginBottom:6 }}>All Weather 缺口參考</div>
-                <div style={{ display:'flex', gap:16, flexWrap:'wrap' }}>
-                  {c.awRows.filter(r => r.gap>0.01).map((r,i) => (
-                    <div key={i} style={{ fontSize:12 }}>
-                      <span style={{ color:CAT_COLOR[r.cat], fontWeight:700 }}>{r.cat}</span>
-                      <span style={{ color:'#777', marginLeft:4 }}>缺 {fmtTWD(r.gapAmt)}</span>
+              <div style={{ background: '#faf9f7', border: '1px solid #e6e2dc', borderRadius: 4, padding: '10px 14px', marginBottom: 16 }}>
+                <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '.09em', textTransform: 'uppercase', color: '#888', marginBottom: 6 }}>All Weather 缺口參考</div>
+                <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
+                  {c.awRows.filter(r => r.gap > 0.01).map((r, i) => (
+                    <div key={i} style={{ fontSize: 12 }}>
+                      <span style={{ color: CAT_COLOR[r.cat], fontWeight: 700 }}>{r.cat}</span>
+                      <span style={{ color: '#777', marginLeft: 4 }}>缺 {fmtTWD(r.gapAmt)}</span>
                     </div>
                   ))}
                 </div>
               </div>
-
-              {simRows.map((row,i) => (
-                <div key={i} style={{ border:'1px solid #e6e2dc', borderRadius:4, padding:'12px 14px', marginBottom:10 }}>
-                  <div style={{ display:'flex', gap:6, marginBottom:10 }}>
-                    {(['list','custom'] as const).map(m => (
-                      <button key={m} onClick={() => setSimRows(r => r.map((x,j) => j===i?{...x,mode:m}:x))}
-                        style={{ fontSize:11, fontWeight:600, padding:'4px 10px', borderRadius:3, cursor:'pointer', border:'1.5px solid', borderColor:row.mode===m?'#1a1a1a':'#e6e2dc', background:row.mode===m?'#1a1a1a':'transparent', color:row.mode===m?'#fff':'#888' }}>
-                        {m==='list'?'從清單選':'手動輸入'}
+              {simRows.map((row, i) => (
+                <div key={i} style={{ border: '1px solid #e6e2dc', borderRadius: 4, padding: '12px 14px', marginBottom: 10 }}>
+                  <div style={{ display: 'flex', gap: 6, marginBottom: 10 }}>
+                    {(['list', 'custom'] as const).map(m => (
+                      <button key={m} onClick={() => setSimRows(r => r.map((x, j) => j === i ? { ...x, mode: m } : x))}
+                        style={{ fontSize: 11, fontWeight: 600, padding: '4px 10px', borderRadius: 3, cursor: 'pointer', border: '1.5px solid', borderColor: row.mode === m ? '#1a1a1a' : '#e6e2dc', background: row.mode === m ? '#1a1a1a' : 'transparent', color: row.mode === m ? '#fff' : '#888' }}>
+                        {m === 'list' ? '從清單選' : '手動輸入'}
                       </button>
                     ))}
                   </div>
                   {row.mode === 'list' ? (
-                    <div style={{ display:'grid', gridTemplateColumns:'1fr 110px 36px', gap:8, alignItems:'center' }}>
-                      <select className="inp" value={row.ticker} onChange={e => setSimRows(r => r.map((x,j) => j===i?{...x,ticker:e.target.value}:x))}>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 110px 36px', gap: 8, alignItems: 'center' }}>
+                      <select className="inp" value={row.ticker} onChange={e => setSimRows(r => r.map((x, j) => j === i ? { ...x, ticker: e.target.value } : x))}>
                         {c.tickers.map(t => <option key={t.ticker} value={String(t.ticker)}>{t.ticker} · {t.name}</option>)}
                       </select>
-                      <input type="number" className="inp" value={row.shares} min={0} placeholder="股數" onChange={e => setSimRows(r => r.map((x,j) => j===i?{...x,shares:Number(e.target.value)}:x))} />
-                      <button className="bd-r" onClick={() => setSimRows(r => r.filter((_,j) => j!==i))}>✕</button>
+                      <input type="number" className="inp" value={row.shares} min={0} placeholder="股數" onChange={e => setSimRows(r => r.map((x, j) => j === i ? { ...x, shares: Number(e.target.value) } : x))} />
+                      <button className="bd-r" onClick={() => setSimRows(r => r.filter((_, j) => j !== i))}>✕</button>
                     </div>
                   ) : (
-                    <div style={{ display:'grid', gridTemplateColumns:'1fr 75px 90px 110px 36px', gap:8, alignItems:'center' }}>
-                      <input className="inp" placeholder="Ticker（如 TLT）" value={row.customTicker} onChange={e => setSimRows(r => r.map((x,j) => j===i?{...x,customTicker:e.target.value.toUpperCase()}:x))} />
-                      <select className="inp" value={row.customCurrency} onChange={e => setSimRows(r => r.map((x,j) => j===i?{...x,customCurrency:e.target.value}:x))}>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 75px 90px 110px 36px', gap: 8, alignItems: 'center' }}>
+                      <input className="inp" placeholder="Ticker（如 TLT）" value={row.customTicker} onChange={e => setSimRows(r => r.map((x, j) => j === i ? { ...x, customTicker: e.target.value.toUpperCase() } : x))} />
+                      <select className="inp" value={row.customCurrency} onChange={e => setSimRows(r => r.map((x, j) => j === i ? { ...x, customCurrency: e.target.value } : x))}>
                         <option value="TWD">TWD</option>
                         <option value="USD">USD</option>
                       </select>
-                      <input type="number" className="inp" placeholder="模擬價格" value={row.customPrice||''} min={0} onChange={e => setSimRows(r => r.map((x,j) => j===i?{...x,customPrice:Number(e.target.value)}:x))} />
-                      <input type="number" className="inp" placeholder="股數" value={row.shares} min={0} onChange={e => setSimRows(r => r.map((x,j) => j===i?{...x,shares:Number(e.target.value)}:x))} />
-                      <button className="bd-r" onClick={() => setSimRows(r => r.filter((_,j) => j!==i))}>✕</button>
+                      <input type="number" className="inp" placeholder="模擬價格" value={row.customPrice || ''} min={0} onChange={e => setSimRows(r => r.map((x, j) => j === i ? { ...x, customPrice: Number(e.target.value) } : x))} />
+                      <input type="number" className="inp" placeholder="股數" value={row.shares} min={0} onChange={e => setSimRows(r => r.map((x, j) => j === i ? { ...x, shares: Number(e.target.value) } : x))} />
+                      <button className="bd-r" onClick={() => setSimRows(r => r.filter((_, j) => j !== i))}>✕</button>
                     </div>
                   )}
                 </div>
@@ -686,29 +847,29 @@ export default function Dashboard() {
             </div>
 
             {simResults.length > 0 && (
-              <div className="card">
+              <div className="card card-hover">
                 <div className="lbl">模擬結果</div>
-                {simResults.map((r,i) => (
-                  <div key={i} style={{ background:'#faf9f7', border:'1px solid #e6e2dc', borderRadius:4, padding:'14px', marginBottom:10 }}>
-                    <div style={{ display:'flex', justifyContent:'space-between', marginBottom:12 }}>
+                {simResults.map((r, i) => (
+                  <div key={i} style={{ background: '#faf9f7', border: '1px solid #e6e2dc', borderRadius: 4, padding: 14, marginBottom: 10 }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 12 }}>
                       <div>
-                        <span style={{ fontSize:14, fontWeight:700 }}>{r.ticker}</span>
-                        <span style={{ fontSize:12, color:'#777', marginLeft:8 }}>{r.name} · 買入 {r.qty} 股</span>
-                        {r.origSh===0 && <span style={{ fontSize:10, fontWeight:700, marginLeft:6, padding:'2px 6px', background:'#f0f9ff', color:'#0284c7', borderRadius:2, border:'1px solid #bae6fd' }}>NEW</span>}
+                        <span style={{ fontSize: 14, fontWeight: 700 }}>{r.ticker}</span>
+                        <span style={{ fontSize: 12, color: '#777', marginLeft: 8 }}>{r.name} · 買入 {r.qty} 股</span>
+                        {r.origSh === 0 && <span style={{ fontSize: 10, fontWeight: 700, marginLeft: 6, padding: '2px 6px', background: '#f0f9ff', color: '#0284c7', borderRadius: 2, border: '1px solid #bae6fd' }}>NEW</span>}
                       </div>
-                      <div className="serif" style={{ fontSize:14, fontWeight:700, color:'#16a34a' }}>{fmtTWD(r.buyAmt)}</div>
+                      <div className="serif" style={{ fontSize: 14, fontWeight: 700, color: '#16a34a' }}>{fmtTWD(r.buyAmt)}</div>
                     </div>
-                    <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:10 }}>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 10 }}>
                       {[
-                        { lbl:'新均成本', b:r.origSh>0?`${fmtNum(r.origAvg)} ${r.currency}`:'—', a:`${fmtNum(r.nAvg)} ${r.currency}` },
-                        { lbl:'持股數',   b:`${r.origSh} 股`, a:`${r.nSh} 股` },
-                        { lbl:'未實現損益', b:r.origSh>0?`${r.origPnL>=0?'+':''}${fmtTWD(r.origPnL)}`:'—', a:`${r.nPnL>=0?'+':''}${fmtTWD(r.nPnL)}` },
-                        { lbl:'報酬率',   b:r.origSh>0?`${r.origRet>=0?'+':''}${fmtPct(r.origRet)}`:'—', a:`${r.nRet>=0?'+':''}${fmtPct(r.nRet)}` },
-                      ].map((cc,j) => (
+                        { lbl: '新均成本', b: r.origSh > 0 ? `${fmtNum(r.origAvg)} ${r.currency}` : '—', a: `${fmtNum(r.nAvg)} ${r.currency}` },
+                        { lbl: '持股數',   b: `${r.origSh} 股`, a: `${r.nSh} 股` },
+                        { lbl: '未實現損益', b: r.origSh > 0 ? `${r.origPnL >= 0 ? '+' : ''}${fmtTWD(r.origPnL)}` : '—', a: `${r.nPnL >= 0 ? '+' : ''}${fmtTWD(r.nPnL)}` },
+                        { lbl: '報酬率',   b: r.origSh > 0 ? `${r.origRet >= 0 ? '+' : ''}${fmtPct(r.origRet)}` : '—', a: `${r.nRet >= 0 ? '+' : ''}${fmtPct(r.nRet)}` },
+                      ].map((cc, j) => (
                         <div key={j}>
-                          <div style={{ fontSize:10, fontWeight:700, letterSpacing:'.07em', textTransform:'uppercase', color:'#888', marginBottom:4 }}>{cc.lbl}</div>
-                          <div style={{ fontSize:11, color:'#bbb', textDecoration:'line-through', marginBottom:2 }}>{cc.b}</div>
-                          <div style={{ fontSize:13, fontWeight:700 }}>{cc.a}</div>
+                          <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '.07em', textTransform: 'uppercase', color: '#888', marginBottom: 4 }}>{cc.lbl}</div>
+                          <div style={{ fontSize: 11, color: '#bbb', textDecoration: 'line-through', marginBottom: 2 }}>{cc.b}</div>
+                          <div style={{ fontSize: 13, fontWeight: 700 }}>{cc.a}</div>
                         </div>
                       ))}
                     </div>
@@ -716,36 +877,38 @@ export default function Dashboard() {
                 ))}
                 <div className="hr" />
                 <div className="lbl">執行後 All Weather 配置</div>
-                {Object.entries(c.awTargets).map(([cat,tgt],i) => {
-                  const bef = c.base>0?c.awCur[cat]/c.base:0;
-                  const aft = simNewBase>0?simNewAW[cat]/simNewBase:0;
+                {Object.entries(c.awTargets).map(([cat, tgt], i) => {
+                  const bef = c.base > 0 ? c.awCur[cat] / c.base : 0;
+                  const aft = simNewBase > 0 ? simNewAW[cat] / simNewBase : 0;
                   return (
-                    <div key={i} style={{ marginBottom:i<2?14:0 }}>
-                      <div style={{ display:'flex', justifyContent:'space-between', marginBottom:5 }}>
-                        <div style={{ display:'flex', alignItems:'center', gap:7 }}>
-                          <div style={{ width:7, height:7, borderRadius:'50%', background:CAT_COLOR[cat] }} />
-                          <span style={{ fontSize:13, fontWeight:600 }}>{cat}</span>
+                    <div key={i} style={{ marginBottom: i < 2 ? 14 : 0 }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 5 }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                          <div style={{ width: 7, height: 7, borderRadius: '50%', background: CAT_COLOR[cat] }} />
+                          <span style={{ fontSize: 13, fontWeight: 600 }}>{cat}</span>
                         </div>
-                        <span style={{ fontSize:12 }}>
-                          <span style={{ color:'#777' }}>{fmtPct(bef)}</span>
-                          <span style={{ color:'#ccc', margin:'0 5px' }}>→</span>
-                          <span style={{ fontWeight:700, color:CAT_COLOR[cat] }}>{fmtPct(aft)}</span>
-                          <span style={{ color:'#bbb' }}> / {fmtPct(tgt)}</span>
+                        <span style={{ fontSize: 12 }}>
+                          <span style={{ color: '#777' }}>{fmtPct(bef)}</span>
+                          <span style={{ color: '#ccc', margin: '0 5px' }}>→</span>
+                          <span style={{ fontWeight: 700, color: CAT_COLOR[cat] }}>{fmtPct(aft)}</span>
+                          <span style={{ color: '#bbb' }}> / {fmtPct(tgt)}</span>
                         </span>
                       </div>
-                      <div className="bar"><div className="bf" style={{ width:`${Math.min(aft/tgt,1)*100}%`, background:CAT_COLOR[cat], opacity:.65 }} /></div>
+                      <div className="bar">
+                        <div className="bf" style={{ width: `${Math.min(aft / tgt, 1) * 100}%`, background: CAT_COLOR[cat], opacity: .65 }} />
+                      </div>
                     </div>
                   );
                 })}
                 <div className="hr" />
-                <div style={{ display:'flex', justifyContent:'space-between' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                   <div>
-                    <div style={{ fontSize:11, color:'#777', marginBottom:3 }}>模擬總投入</div>
-                    <div className="serif" style={{ fontSize:18, fontWeight:700 }}>{fmtTWD(simTotal)}</div>
+                    <div style={{ fontSize: 11, color: '#777', marginBottom: 3 }}>模擬總投入</div>
+                    <div className="serif" style={{ fontSize: 18, fontWeight: 700 }}>{fmtTWD(simTotal)}</div>
                   </div>
-                  <div style={{ textAlign:'right' }}>
-                    <div style={{ fontSize:11, color:'#777', marginBottom:3 }}>執行後可動用現金</div>
-                    <div className="serif" style={{ fontSize:18, fontWeight:700, color:c.avail-simTotal<0?'#dc2626':'#1a1a1a' }}>{fmtTWD(c.avail-simTotal)}</div>
+                  <div style={{ textAlign: 'right' }}>
+                    <div style={{ fontSize: 11, color: '#777', marginBottom: 3 }}>執行後可動用現金</div>
+                    <div className="serif" style={{ fontSize: 18, fontWeight: 700, color: c.avail - simTotal < 0 ? '#dc2626' : '#1a1a1a' }}>{fmtTWD(c.avail - simTotal)}</div>
                   </div>
                 </div>
               </div>
@@ -755,38 +918,38 @@ export default function Dashboard() {
 
         {/* REALIZED */}
         {tab === 'realized' && (
-          <div className="fu card">
+          <div className="fu card card-hover">
             <div className="lbl">已實現績效</div>
             {c.realizedRows.length === 0
-              ? <div style={{ fontSize:14, color:'#999', padding:'16px 0' }}>尚無已出場紀錄</div>
-              : c.realizedRows.map((r,i) => (
-                <div key={i} style={{ padding:'16px 0', borderBottom:i<c.realizedRows.length-1?'1px solid #f0ede8':'none' }}>
-                  <div style={{ display:'flex', justifyContent:'space-between', marginBottom:12 }}>
+              ? <div style={{ fontSize: 14, color: '#999', padding: '16px 0' }}>尚無已出場紀錄</div>
+              : c.realizedRows.map((r, i) => (
+                <div key={i} className="row-hover" style={{ padding: '16px 4px', borderBottom: i < c.realizedRows.length - 1 ? '1px solid #f0ede8' : 'none' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 12 }}>
                     <div>
-                      <div style={{ fontSize:15, fontWeight:700 }}>{String(r.ticker)} · {String(r.instrument)}</div>
-                      <div style={{ fontSize:11, color:'#999', marginTop:3 }}>持有 {r.holdingDays} 天</div>
+                      <div style={{ fontSize: 15, fontWeight: 700 }}>{String(r.ticker)} · {String(r.instrument)}</div>
+                      <div style={{ fontSize: 11, color: '#999', marginTop: 3 }}>持有 {r.holdingDays} 天</div>
                     </div>
-                    <div style={{ textAlign:'right' }}>
-                      <div className="serif" style={{ fontSize:16, fontWeight:700, color:r.pnlTWD>=0?'#16a34a':'#dc2626' }}>
-                        {r.pnlTWD>=0?'+':''}{fmtTWD(r.pnlTWD)}
+                    <div style={{ textAlign: 'right' }}>
+                      <div className="serif" style={{ fontSize: 16, fontWeight: 700, color: r.pnlTWD >= 0 ? '#16a34a' : '#dc2626' }}>
+                        {r.pnlTWD >= 0 ? '+' : ''}{fmtTWD(r.pnlTWD)}
                       </div>
-                      <div style={{ fontSize:12, color:'#888', marginTop:2 }}>報酬率 {fmtPct(r.returnPct)}</div>
+                      <div style={{ fontSize: 12, color: '#888', marginTop: 2 }}>報酬率 {fmtPct(r.returnPct)}</div>
                     </div>
                   </div>
-                  <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:12 }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 12 }}>
                     {[
-                      {lbl:'買入成本', v:fmtTWD(r.buyCost)},
-                      {lbl:'賣出金額', v:fmtTWD(r.sellValue)},
-                      {lbl:'年化報酬', v:fmtPct(r.annReturn)},
-                      {lbl:'年化 Alpha', v:fmtPct(r.annAlpha)},
-                    ].map((cc,j) => (
+                      { lbl: '買入成本', v: fmtTWD(r.buyCost) },
+                      { lbl: '賣出金額', v: fmtTWD(r.sellValue) },
+                      { lbl: '年化報酬', v: fmtPct(r.annReturn) },
+                      { lbl: '年化 Alpha', v: fmtPct(r.annAlpha) },
+                    ].map((cc, j) => (
                       <div key={j}>
-                        <div style={{ fontSize:10, fontWeight:700, letterSpacing:'.07em', textTransform:'uppercase', color:'#888', marginBottom:4 }}>{cc.lbl}</div>
-                        <div style={{ fontSize:13, fontWeight:600 }}>{cc.v}</div>
+                        <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: '.07em', textTransform: 'uppercase', color: '#888', marginBottom: 4 }}>{cc.lbl}</div>
+                        <div style={{ fontSize: 13, fontWeight: 600 }}>{cc.v}</div>
                       </div>
                     ))}
                   </div>
-                  {r.notes && <div style={{ fontSize:12, color:'#888', marginTop:10, fontStyle:'italic' }}>「{r.notes}」</div>}
+                  {r.notes && <div style={{ fontSize: 12, color: '#888', marginTop: 10, fontStyle: 'italic' }}>「{r.notes}」</div>}
                 </div>
               ))
             }
