@@ -35,7 +35,11 @@ function usePortfolioData() {
   const fetchData = async () => {
     setLoading(true);
     try {
-      const res = await fetch('/api/sheets');
+      const res = await fetch('/api/sheets', {
+  headers: {
+    'x-wm-secret': process.env.NEXT_PUBLIC_WM_SECRET || ''
+  }
+});
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json = await res.json();
       setData(json); setLastUpdated(new Date()); setError(null);
