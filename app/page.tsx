@@ -78,17 +78,38 @@ function compute(data: Record<string, unknown> | null) {
 
   const positions: Position[] = tickers.map(t => {
     const tid = String(t.ticker);
-    const buys  = trades.filter(r => String(r[1]) === tid && r[3] === 'Buy');
-    const sells = trades.filter(r => String(r[1]) === tid && r[3] === 'Sell');
-    const sh = buys.reduce((s, r) => s + toF(r[6]), 0)
-             - sells.reduce((s, r) => s + toF(r[6]), 0);
-    const costTWD = buys.reduce((s, r) => s + toF(r[12]), 0);
+    // 依日期排序，逐筆累計（憲法 6.1 加權平均成本法）
+    const rows = trades
+      .filter(r => String(r[1]) === tid)
+      .sort((a, b) => new Date(String(a[0])).getTime() - new Date(String(b[0])).getTime());
+
+    let sh = 0;        // 剩餘持股
+    let costTWD = 0;   // 剩餘持股的台幣成本
+    let costOrig = 0;  // 剩餘持股的原始幣別成本（USD/TWD）
+    for (const r of rows) {
+      const qty = toF(r[6]);
+      if (r[3] === 'Buy') {
+        sh += qty;
+        costTWD  += toF(r[12]); // Total Amount TWD
+        costOrig += toF(r[9]);  // Total Amount（原始幣別）
+      } else if (r[3] === 'Sell') {
+        // 賣出：按當下加權均價同步扣減成本，維持分子分母同口徑
+        if (sh > 0) {
+          const avgTWD  = costTWD  / sh;
+          const avgOrig = costOrig / sh;
+          costTWD  -= avgTWD  * qty;
+          costOrig -= avgOrig * qty;
+        }
+        sh -= qty;
+      }
+    }
     if (sh <= 0) return null;
     const cp = getPrice(cfg, tid);
     const mvTWD = cp > 0 ? (t.currency === 'USD' ? cp * sh * fx : cp * sh) : costTWD;
     const pnlTWD = cp > 0 ? mvTWD - costTWD : 0;
     const ret = costTWD > 0 && cp > 0 ? pnlTWD / costTWD : 0;
-    const avgCost = t.currency === 'USD' ? (costTWD / sh) / fx : costTWD / sh;
+    // 均價用原始幣別成本，不繞匯率（同時修好美元均價誤差）
+    const avgCost = sh > 0 ? costOrig / sh : 0;
     return { ...t, sh, costTWD, cp, mvTWD, pnlTWD, ret, avgCost, portPct: 0 };
   }).filter(Boolean) as Position[];
 
